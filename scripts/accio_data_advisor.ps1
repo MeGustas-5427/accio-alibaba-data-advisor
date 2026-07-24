@@ -1,0 +1,499 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('status', 'update-token', 'self-test', 'list-tools', 'shop-summary', 'visitor-detail')]
+    [string]$Action,
+
+    [string]$StartDate,
+    [string]$EndDate,
+
+    [ValidateSet('day', 'week', 'month')]
+    [string]$StatisticsType = 'day',
+
+    [ValidateSet('true', 'false')]
+    [string]$IsMcFb = 'true',
+
+    [ValidateRange(1, 2147483647)]
+    [int]$PageNo = 1,
+
+    [ValidateRange(1, 100)]
+    [int]$PageSize = 20,
+
+    [switch]$AllowAccioStopped
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
+
+$SkillDir = Split-Path -Parent $PSScriptRoot
+$StateDir = Join-Path $SkillDir 'state'
+$CredentialFile = Join-Path $StateDir 'credentials.dpapi'
+$RemoteUrl = 'https://phoenix-gw.alibaba.com/api/mcp/proxy'
+$EntropyText = 'accio-alibaba-data-advisor:v1'
+$RequiredTools = @('data_advisor_shop_summary', 'data_advisor_visitor_detail')
+
+function Redact-Text {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return $null }
+    $safe = $Text
+    $safe = $safe -replace '(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+', '$1[REDACTED]'
+    $safe = $safe -replace '(?i)((?:access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|credential|connectId|sessionKey)\s*[:=]\s*)("[^"]*"|''[^'']*''|[^\s,;&]+)', '$1[REDACTED]'
+    return $safe
+}
+
+function Test-SensitiveKey {
+    param([string]$Name)
+    return $Name -match '(?i)^(authorization|cookie|set-cookie|password|secret|credential|access[_-]?token|refresh[_-]?token|token|api[_-]?key|connectId|sessionKey)$'
+}
+
+function ConvertTo-SafeValue {
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return (Redact-Text $Value) }
+    if ($Value -is [ValueType] -or $Value -is [DateTime] -or $Value -is [DateTimeOffset]) { return $Value }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            $name = [string]$key
+            $copy[$name] = if (Test-SensitiveKey $name) { '[REDACTED]' } else { ConvertTo-SafeValue $Value[$key] }
+        }
+        return $copy
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = foreach ($item in $Value) { ConvertTo-SafeValue $item }
+        return ,@($items)
+    }
+
+    $properties = @($Value.PSObject.Properties | Where-Object { $_.MemberType -in @('NoteProperty', 'Property') })
+    if ($properties.Count -gt 0) {
+        $copy = [ordered]@{}
+        foreach ($property in $properties) {
+            $copy[$property.Name] = if (Test-SensitiveKey $property.Name) { '[REDACTED]' } else { ConvertTo-SafeValue $property.Value }
+        }
+        return [pscustomobject]$copy
+    }
+
+    return $Value
+}
+
+function Write-Json {
+    param([Parameter(Mandatory = $true)]$Value)
+    $safe = ConvertTo-SafeValue $Value
+    $safe | ConvertTo-Json -Depth 100
+}
+
+function Get-Entropy {
+    return [Text.Encoding]::UTF8.GetBytes($EntropyText)
+}
+
+function Convert-ExpiresAt {
+    param([Parameter(Mandatory = $true)][Int64]$Milliseconds)
+    return [DateTimeOffset]::FromUnixTimeMilliseconds($Milliseconds)
+}
+
+function Assert-CredentialShape {
+    param([Parameter(Mandatory = $true)]$Credential)
+    if ([string]::IsNullOrWhiteSpace([string]$Credential.accessToken)) { throw 'Credential has no access token.' }
+    if ([string]::IsNullOrWhiteSpace([string]$Credential.refreshToken)) { throw 'Credential has no refresh token.' }
+    if ($null -eq $Credential.expiresAt -or [Int64]$Credential.expiresAt -le 0) { throw 'Credential has no valid expiry.' }
+}
+
+function Assert-CredentialUsable {
+    param([Parameter(Mandatory = $true)]$Credential)
+    Assert-CredentialShape $Credential
+    $expiry = Convert-ExpiresAt ([Int64]$Credential.expiresAt)
+    if ($expiry -le [DateTimeOffset]::UtcNow.AddMinutes(5)) {
+        throw "Stored token is expired or expires within 5 minutes. Open Accio and run update-token."
+    }
+}
+
+function Read-SkillCredential {
+    if (-not (Test-Path -LiteralPath $CredentialFile)) {
+        throw "Skill credential is missing. Open Accio and run update-token."
+    }
+
+    $protected = $null
+    $plain = $null
+    $entropy = $null
+    try {
+        $protected = [IO.File]::ReadAllBytes($CredentialFile)
+        $entropy = Get-Entropy
+        $plain = [Security.Cryptography.ProtectedData]::Unprotect(
+            $protected,
+            $entropy,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        $credential = [Text.Encoding]::UTF8.GetString($plain) | ConvertFrom-Json
+        Assert-CredentialShape $credential
+        return $credential
+    }
+    finally {
+        if ($plain) { [Array]::Clear($plain, 0, $plain.Length) }
+        if ($entropy) { [Array]::Clear($entropy, 0, $entropy.Length) }
+        $protected = $null
+        $plain = $null
+        $entropy = $null
+    }
+}
+
+function Read-AccioCredential {
+    $base = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Accio'
+    $credentialPath = Join-Path $base 'credentials.enc'
+    $localStatePath = Join-Path $base 'Local State'
+
+    if (-not (Test-Path -LiteralPath $credentialPath)) { throw "Accio credential file not found: $credentialPath" }
+    if (-not (Test-Path -LiteralPath $localStatePath)) { throw "Accio Local State not found: $localStatePath" }
+
+    $masterKey = $null
+    $plain = $null
+    $aes = $null
+    try {
+        $localState = Get-Content -Raw -LiteralPath $localStatePath | ConvertFrom-Json
+        $wrappedKey = [Convert]::FromBase64String([string]$localState.os_crypt.encrypted_key)
+        if ($wrappedKey.Length -le 5 -or [Text.Encoding]::ASCII.GetString($wrappedKey, 0, 5) -ne 'DPAPI') {
+            throw 'Unexpected Accio Local State key format.'
+        }
+
+        $protectedKey = New-Object byte[] ($wrappedKey.Length - 5)
+        [Array]::Copy($wrappedKey, 5, $protectedKey, 0, $protectedKey.Length)
+        $masterKey = [Security.Cryptography.ProtectedData]::Unprotect(
+            $protectedKey,
+            $null,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+
+        $encrypted = [IO.File]::ReadAllBytes($credentialPath)
+        if ($encrypted.Length -le 31 -or [Text.Encoding]::ASCII.GetString($encrypted, 0, 3) -ne 'v10') {
+            throw 'Unexpected Accio credentials format.'
+        }
+
+        $nonce = New-Object byte[] 12
+        [Array]::Copy($encrypted, 3, $nonce, 0, 12)
+        $cipherLength = $encrypted.Length - 31
+        $cipher = New-Object byte[] $cipherLength
+        [Array]::Copy($encrypted, 15, $cipher, 0, $cipherLength)
+        $tag = New-Object byte[] 16
+        [Array]::Copy($encrypted, 15 + $cipherLength, $tag, 0, 16)
+        $plain = New-Object byte[] $cipherLength
+
+        $aes = [Security.Cryptography.AesGcm]::new($masterKey, 16)
+        $aes.Decrypt($nonce, $cipher, $tag, $plain, $null)
+        $credential = [Text.Encoding]::UTF8.GetString($plain) | ConvertFrom-Json
+        Assert-CredentialShape $credential
+        return $credential
+    }
+    finally {
+        if ($aes) { $aes.Dispose() }
+        if ($masterKey) { [Array]::Clear($masterKey, 0, $masterKey.Length) }
+        if ($plain) { [Array]::Clear($plain, 0, $plain.Length) }
+        $masterKey = $null
+        $plain = $null
+        $aes = $null
+    }
+}
+
+function Save-SkillCredential {
+    param([Parameter(Mandatory = $true)]$Credential)
+    Assert-CredentialUsable $Credential
+
+    [IO.Directory]::CreateDirectory($StateDir) | Out-Null
+    $payload = [ordered]@{
+        schemaVersion = 1
+        accessToken = [string]$Credential.accessToken
+        refreshToken = [string]$Credential.refreshToken
+        expiresAt = [Int64]$Credential.expiresAt
+        syncedAt = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+
+    $plain = $null
+    $protected = $null
+    $entropy = $null
+    $temporary = Join-Path $StateDir ('.credentials-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $plain = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Compress))
+        $entropy = Get-Entropy
+        $protected = [Security.Cryptography.ProtectedData]::Protect(
+            $plain,
+            $entropy,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        [IO.File]::WriteAllBytes($temporary, $protected)
+        [IO.File]::Move($temporary, $CredentialFile, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        if ($plain) { [Array]::Clear($plain, 0, $plain.Length) }
+        if ($protected) { [Array]::Clear($protected, 0, $protected.Length) }
+        if ($entropy) { [Array]::Clear($entropy, 0, $entropy.Length) }
+        $plain = $null
+        $protected = $null
+        $entropy = $null
+    }
+}
+
+function Invoke-RemoteMcp {
+    param(
+        [Parameter(Mandatory = $true)][string]$AccessToken,
+        [Parameter(Mandatory = $true)]$Request
+    )
+
+    $body = [ordered]@{ accessToken = $AccessToken; request = $Request } | ConvertTo-Json -Depth 30 -Compress
+    $response = Invoke-WebRequest `
+        -Uri $RemoteUrl `
+        -Method Post `
+        -ContentType 'application/json' `
+        -Headers @{ Accept = 'application/json, text/event-stream'; 'x-language' = 'zh-CN'; 'x-source' = 'ACCIO_DESKTOP' } `
+        -Body $body `
+        -TimeoutSec 45
+
+    $raw = [string]$response.Content
+    $candidates = @()
+    foreach ($line in ($raw -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed.StartsWith('data:')) { continue }
+        $json = $trimmed.Substring(5).Trim()
+        if (-not $json) { continue }
+        try { $candidates += ,($json | ConvertFrom-Json -Depth 100) } catch { }
+    }
+
+    if ($candidates.Count -gt 0) {
+        $parsed = $candidates | Where-Object {
+            $null -ne $_.PSObject.Properties['result'] -or
+            $null -ne $_.PSObject.Properties['error']
+        } | Select-Object -First 1
+        if ($null -eq $parsed) { $parsed = $candidates[0] }
+    }
+    else {
+        $parsed = $raw | ConvertFrom-Json -Depth 100
+    }
+
+    if (
+        $null -ne $parsed.PSObject.Properties['success'] -and
+        $null -ne $parsed.PSObject.Properties['data']
+    ) {
+        if (-not [bool]$parsed.success) { throw "Remote MCP rejected the request: $(Redact-Text ([string]$parsed.message))" }
+        $parsed = $parsed.data
+    }
+    if ($null -ne $parsed.PSObject.Properties['error'] -and $null -ne $parsed.error) {
+        throw "Remote MCP error: $(Redact-Text (($parsed.error | ConvertTo-Json -Compress -Depth 20)))"
+    }
+    return $parsed
+}
+
+function New-RpcRequest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Method,
+        [Parameter(Mandatory = $true)]$Params
+    )
+    return [ordered]@{
+        jsonrpc = '2.0'
+        id = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        method = $Method
+        params = $Params
+    }
+}
+
+function Get-RemoteCatalog {
+    param([Parameter(Mandatory = $true)][string]$AccessToken)
+    $request = New-RpcRequest -Method 'tools/list' -Params @{}
+    $response = Invoke-RemoteMcp -AccessToken $AccessToken -Request $request
+    $tools = @($response.result.tools)
+    if ($tools.Count -eq 0) { throw 'Remote MCP returned no tools.' }
+    return $tools
+}
+
+function Assert-RequiredTools {
+    param([Parameter(Mandatory = $true)]$Tools)
+    $names = @($Tools | ForEach-Object { [string]$_.name })
+    $missing = @($RequiredTools | Where-Object { $_ -notin $names })
+    if ($missing.Count -gt 0) { throw "Required Data Advisor tools are missing: $($missing -join ', ')" }
+}
+
+function Convert-StrictDate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw "$Name is required." }
+    $parsed = [DateTime]::MinValue
+    $ok = [DateTime]::TryParseExact(
+        $Value,
+        'yyyy-MM-dd',
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::None,
+        [ref]$parsed
+    )
+    if (-not $ok) { throw "$Name must use YYYY-MM-DD." }
+    return $parsed
+}
+
+function Get-QueryDates {
+    $start = Convert-StrictDate -Value $StartDate -Name 'StartDate'
+    $end = Convert-StrictDate -Value $EndDate -Name 'EndDate'
+    if ($start -gt $end) { throw 'StartDate must not be after EndDate.' }
+    return @($start, $end)
+}
+
+function Invoke-DataAdvisorTool {
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolName,
+        [Parameter(Mandatory = $true)]$Arguments
+    )
+    if ($ToolName -notin $RequiredTools) { throw "Tool is not allowed by this skill: $ToolName" }
+
+    $credential = Read-SkillCredential
+    Assert-CredentialUsable $credential
+    $request = New-RpcRequest -Method 'tools/call' -Params ([ordered]@{ name = $ToolName; arguments = $Arguments })
+    $response = Invoke-RemoteMcp -AccessToken ([string]$credential.accessToken) -Request $request
+    $result = $response.result
+    if ($null -ne $result.PSObject.Properties['isError'] -and [bool]$result.isError) {
+        throw "Data Advisor tool returned an error: $(Redact-Text (($result.content | ConvertTo-Json -Compress -Depth 20)))"
+    }
+
+    $content = @($result.content)
+    if ($content.Count -eq 1 -and $null -ne $content[0].PSObject.Properties['text']) {
+        $text = [string]$content[0].text
+        try { $payload = $text | ConvertFrom-Json -Depth 100 }
+        catch { return (Redact-Text $text) }
+        if ($null -ne $payload.PSObject.Properties['success'] -and -not [bool]$payload.success) {
+            $reason = if ($null -ne $payload.PSObject.Properties['errorMsg']) { [string]$payload.errorMsg } else { 'unknown error' }
+            throw "Data Advisor API rejected the request: $(Redact-Text $reason)"
+        }
+        return $payload
+    }
+    return $result
+}
+
+try {
+    switch ($Action) {
+        'status' {
+            if (-not (Test-Path -LiteralPath $CredentialFile)) {
+                Write-Json ([ordered]@{
+                    action = 'status'
+                    credentialFile = $CredentialFile
+                    exists = $false
+                    ready = $false
+                    nextAction = 'Open and sign in to Accio, then run update-token.'
+                })
+                break
+            }
+
+            $credential = Read-SkillCredential
+            $expiry = Convert-ExpiresAt ([Int64]$credential.expiresAt)
+            $remaining = [Math]::Floor(($expiry - [DateTimeOffset]::UtcNow).TotalMinutes)
+            Write-Json ([ordered]@{
+                action = 'status'
+                credentialFile = $CredentialFile
+                exists = $true
+                decryptable = $true
+                ready = $remaining -gt 5
+                expiresAtUtc = $expiry.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                remainingMinutes = $remaining
+                remoteUrl = $RemoteUrl
+            })
+        }
+
+        'update-token' {
+            if (-not $AllowAccioStopped -and @(Get-Process -Name 'Accio' -ErrorAction SilentlyContinue).Count -eq 0) {
+                throw 'Accio is not running. Open and sign in to Accio before update-token.'
+            }
+
+            $source = Read-AccioCredential
+            Assert-CredentialUsable $source
+            $tools = Get-RemoteCatalog -AccessToken ([string]$source.accessToken)
+            Assert-RequiredTools $tools
+            Save-SkillCredential $source
+            $expiry = Convert-ExpiresAt ([Int64]$source.expiresAt)
+            Write-Json ([ordered]@{
+                action = 'update-token'
+                updated = $true
+                credentialFile = $CredentialFile
+                protection = 'Windows CurrentUser DPAPI'
+                expiresAtUtc = $expiry.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                toolCount = $tools.Count
+                requiredToolsPresent = $true
+            })
+        }
+
+        'self-test' {
+            $credential = Read-SkillCredential
+            Assert-CredentialUsable $credential
+            $tools = Get-RemoteCatalog -AccessToken ([string]$credential.accessToken)
+            Assert-RequiredTools $tools
+            $expiry = Convert-ExpiresAt ([Int64]$credential.expiresAt)
+            Write-Json ([ordered]@{
+                action = 'self-test'
+                ready = $true
+                accioRunning = @(Get-Process -Name 'Accio' -ErrorAction SilentlyContinue).Count -gt 0
+                usesLocalhost4097 = $false
+                remoteUrl = $RemoteUrl
+                toolCount = $tools.Count
+                requiredToolsPresent = $true
+                expiresAtUtc = $expiry.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            })
+        }
+
+        'list-tools' {
+            $credential = Read-SkillCredential
+            Assert-CredentialUsable $credential
+            $tools = Get-RemoteCatalog -AccessToken ([string]$credential.accessToken)
+            $matches = @($tools | Where-Object { [string]$_.name -match '^data_advisor_' } | Select-Object name, description, inputSchema)
+            Write-Json ([ordered]@{
+                action = 'list-tools'
+                count = $matches.Count
+                tools = $matches
+            })
+        }
+
+        'shop-summary' {
+            $dates = Get-QueryDates
+            $arguments = [ordered]@{
+                advisorQueryParam = [ordered]@{
+                    startDate = $dates[0].ToString('yyyy-MM-dd')
+                    endDate = $dates[1].ToString('yyyy-MM-dd')
+                    statisticsType = $StatisticsType
+                }
+            }
+            $data = Invoke-DataAdvisorTool -ToolName 'data_advisor_shop_summary' -Arguments $arguments
+            Write-Json ([ordered]@{
+                action = 'shop-summary'
+                tool = 'data_advisor_shop_summary'
+                request = $arguments
+                data = $data
+            })
+        }
+
+        'visitor-detail' {
+            $dates = Get-QueryDates
+            $arguments = [ordered]@{
+                visitorQueryParam = [ordered]@{
+                    startDate = $dates[0].ToString('yyyy-MM-dd')
+                    endDate = $dates[1].ToString('yyyy-MM-dd')
+                    isMcFb = [Convert]::ToBoolean($IsMcFb)
+                    pageNO = $PageNo
+                    pageSize = $PageSize
+                }
+            }
+            $data = Invoke-DataAdvisorTool -ToolName 'data_advisor_visitor_detail' -Arguments $arguments
+            Write-Json ([ordered]@{
+                action = 'visitor-detail'
+                tool = 'data_advisor_visitor_detail'
+                request = $arguments
+                data = $data
+            })
+        }
+    }
+}
+catch {
+    $message = Redact-Text $_.Exception.Message
+    [Console]::Error.WriteLine(([ordered]@{
+        success = $false
+        action = $Action
+        error = $message
+    } | ConvertTo-Json -Compress))
+    exit 1
+}
