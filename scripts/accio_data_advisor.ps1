@@ -1,11 +1,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('status', 'update-token', 'self-test', 'list-tools', 'shop-summary', 'visitor-detail')]
+    [ValidateSet('status', 'update-token', 'self-test', 'refresh-tools', 'list-tools', 'shop-summary', 'visitor-detail', 'call-tool')]
     [string]$Action,
 
     [string]$StartDate,
     [string]$EndDate,
+    [string]$ToolSearch,
+    [string]$ToolName,
+    [string]$ArgumentsJson = '{}',
 
     [ValidateSet('day', 'week', 'month')]
     [string]$StatisticsType = 'day',
@@ -29,9 +32,9 @@ Add-Type -AssemblyName System.Security
 $SkillDir = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $SkillDir 'state'
 $CredentialFile = Join-Path $StateDir 'credentials.dpapi'
+$ToolCatalogFile = Join-Path $StateDir 'tools_catalog.json'
 $RemoteUrl = 'https://phoenix-gw.alibaba.com/api/mcp/proxy'
 $EntropyText = 'accio-alibaba-data-advisor:v1'
-$RequiredTools = @('data_advisor_shop_summary', 'data_advisor_visitor_detail')
 
 function Redact-Text {
     param([AllowNull()][string]$Text)
@@ -306,11 +309,58 @@ function Get-RemoteCatalog {
     return $tools
 }
 
-function Assert-RequiredTools {
+function Save-ToolCatalog {
     param([Parameter(Mandatory = $true)]$Tools)
-    $names = @($Tools | ForEach-Object { [string]$_.name })
-    $missing = @($RequiredTools | Where-Object { $_ -notin $names })
-    if ($missing.Count -gt 0) { throw "Required Data Advisor tools are missing: $($missing -join ', ')" }
+
+    $toolArray = @($Tools)
+    if ($toolArray.Count -eq 0) { throw 'Cannot cache an empty tool catalog.' }
+
+    [IO.Directory]::CreateDirectory($StateDir) | Out-Null
+    $payload = [ordered]@{
+        schemaVersion = 1
+        fetchedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        remoteUrl = $RemoteUrl
+        toolCount = $toolArray.Count
+        tools = @($toolArray | ForEach-Object { ConvertTo-SafeValue $_ })
+    }
+    $temporary = Join-Path $StateDir ('.tools-catalog-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $json = $payload | ConvertTo-Json -Depth 100
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temporary, $ToolCatalogFile, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+    return [pscustomobject]$payload
+}
+
+function Read-ToolCatalog {
+    if (-not (Test-Path -LiteralPath $ToolCatalogFile)) {
+        throw 'Tool catalog cache is missing. Run refresh-tools once.'
+    }
+
+    $catalog = Get-Content -Raw -LiteralPath $ToolCatalogFile -Encoding UTF8 | ConvertFrom-Json -Depth 100
+    if ($null -eq $catalog.PSObject.Properties['tools']) { throw 'Tool catalog cache has no tools array.' }
+    $tools = @($catalog.tools)
+    if ($tools.Count -eq 0) { throw 'Tool catalog cache is empty.' }
+    if (
+        $null -eq $catalog.PSObject.Properties['toolCount'] -or
+        [int]$catalog.toolCount -ne $tools.Count
+    ) {
+        throw 'Tool catalog cache count does not match its tools array.'
+    }
+    return $catalog
+}
+
+function Assert-ToolCached {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { throw 'ToolName is required.' }
+
+    $catalog = Read-ToolCatalog
+    $matches = @($catalog.tools | Where-Object { [string]$_.name -eq $Name })
+    if ($matches.Count -eq 0) { throw "Tool is not present in the cached catalog: $Name" }
+    if ($matches.Count -gt 1) { throw "Cached catalog contains duplicate tool names: $Name" }
 }
 
 function Convert-StrictDate {
@@ -338,12 +388,12 @@ function Get-QueryDates {
     return @($start, $end)
 }
 
-function Invoke-DataAdvisorTool {
+function Invoke-AccioTool {
     param(
         [Parameter(Mandatory = $true)][string]$ToolName,
         [Parameter(Mandatory = $true)]$Arguments
     )
-    if ($ToolName -notin $RequiredTools) { throw "Tool is not allowed by this skill: $ToolName" }
+    Assert-ToolCached -Name $ToolName
 
     $credential = Read-SkillCredential
     Assert-CredentialUsable $credential
@@ -351,7 +401,7 @@ function Invoke-DataAdvisorTool {
     $response = Invoke-RemoteMcp -AccessToken ([string]$credential.accessToken) -Request $request
     $result = $response.result
     if ($null -ne $result.PSObject.Properties['isError'] -and [bool]$result.isError) {
-        throw "Data Advisor tool returned an error: $(Redact-Text (($result.content | ConvertTo-Json -Compress -Depth 20)))"
+        throw "Accio tool returned an error: $(Redact-Text (($result.content | ConvertTo-Json -Compress -Depth 20)))"
     }
 
     $content = @($result.content)
@@ -361,7 +411,7 @@ function Invoke-DataAdvisorTool {
         catch { return (Redact-Text $text) }
         if ($null -ne $payload.PSObject.Properties['success'] -and -not [bool]$payload.success) {
             $reason = if ($null -ne $payload.PSObject.Properties['errorMsg']) { [string]$payload.errorMsg } else { 'unknown error' }
-            throw "Data Advisor API rejected the request: $(Redact-Text $reason)"
+            throw "Accio tool rejected the request: $(Redact-Text $reason)"
         }
         return $payload
     }
@@ -405,8 +455,8 @@ try {
             $source = Read-AccioCredential
             Assert-CredentialUsable $source
             $tools = Get-RemoteCatalog -AccessToken ([string]$source.accessToken)
-            Assert-RequiredTools $tools
             Save-SkillCredential $source
+            $catalog = Save-ToolCatalog $tools
             $expiry = Convert-ExpiresAt ([Int64]$source.expiresAt)
             Write-Json ([ordered]@{
                 action = 'update-token'
@@ -415,15 +465,15 @@ try {
                 protection = 'Windows CurrentUser DPAPI'
                 expiresAtUtc = $expiry.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
                 toolCount = $tools.Count
-                requiredToolsPresent = $true
+                toolCatalogFile = $ToolCatalogFile
+                catalogFetchedAtUtc = $catalog.fetchedAtUtc
             })
         }
 
         'self-test' {
             $credential = Read-SkillCredential
             Assert-CredentialUsable $credential
-            $tools = Get-RemoteCatalog -AccessToken ([string]$credential.accessToken)
-            Assert-RequiredTools $tools
+            $catalog = Read-ToolCatalog
             $expiry = Convert-ExpiresAt ([Int64]$credential.expiresAt)
             Write-Json ([ordered]@{
                 action = 'self-test'
@@ -431,19 +481,44 @@ try {
                 accioRunning = @(Get-Process -Name 'Accio' -ErrorAction SilentlyContinue).Count -gt 0
                 usesLocalhost4097 = $false
                 remoteUrl = $RemoteUrl
-                toolCount = $tools.Count
-                requiredToolsPresent = $true
+                toolCount = [int]$catalog.toolCount
+                toolCatalogFile = $ToolCatalogFile
+                catalogFetchedAtUtc = [string]$catalog.fetchedAtUtc
+                remoteCatalogRequest = $false
                 expiresAtUtc = $expiry.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
             })
         }
 
-        'list-tools' {
+        'refresh-tools' {
             $credential = Read-SkillCredential
             Assert-CredentialUsable $credential
             $tools = Get-RemoteCatalog -AccessToken ([string]$credential.accessToken)
-            $matches = @($tools | Where-Object { [string]$_.name -match '^data_advisor_' } | Select-Object name, description, inputSchema)
+            $catalog = Save-ToolCatalog $tools
+            Write-Json ([ordered]@{
+                action = 'refresh-tools'
+                refreshed = $true
+                toolCatalogFile = $ToolCatalogFile
+                fetchedAtUtc = $catalog.fetchedAtUtc
+                count = $tools.Count
+            })
+        }
+
+        'list-tools' {
+            $catalog = Read-ToolCatalog
+            $matches = @($catalog.tools)
+            if (-not [string]::IsNullOrWhiteSpace($ToolSearch)) {
+                $matches = @($matches | Where-Object {
+                    $haystack = ([string]$_.name) + "`n" + ([string]$_.description)
+                    $haystack.IndexOf($ToolSearch, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                })
+            }
             Write-Json ([ordered]@{
                 action = 'list-tools'
+                source = 'cache'
+                toolCatalogFile = $ToolCatalogFile
+                fetchedAtUtc = [string]$catalog.fetchedAtUtc
+                totalCount = [int]$catalog.toolCount
+                search = $ToolSearch
                 count = $matches.Count
                 tools = $matches
             })
@@ -458,7 +533,7 @@ try {
                     statisticsType = $StatisticsType
                 }
             }
-            $data = Invoke-DataAdvisorTool -ToolName 'data_advisor_shop_summary' -Arguments $arguments
+            $data = Invoke-AccioTool -ToolName 'data_advisor_shop_summary' -Arguments $arguments
             Write-Json ([ordered]@{
                 action = 'shop-summary'
                 tool = 'data_advisor_shop_summary'
@@ -478,10 +553,31 @@ try {
                     pageSize = $PageSize
                 }
             }
-            $data = Invoke-DataAdvisorTool -ToolName 'data_advisor_visitor_detail' -Arguments $arguments
+            $data = Invoke-AccioTool -ToolName 'data_advisor_visitor_detail' -Arguments $arguments
             Write-Json ([ordered]@{
                 action = 'visitor-detail'
                 tool = 'data_advisor_visitor_detail'
+                request = $arguments
+                data = $data
+            })
+        }
+
+        'call-tool' {
+            if ([string]::IsNullOrWhiteSpace($ToolName)) { throw 'ToolName is required.' }
+            try {
+                $arguments = $ArgumentsJson | ConvertFrom-Json -Depth 100 -AsHashtable
+            }
+            catch {
+                throw "ArgumentsJson must be a valid JSON object: $($_.Exception.Message)"
+            }
+            if ($arguments -isnot [System.Collections.IDictionary]) {
+                throw 'ArgumentsJson must decode to a JSON object.'
+            }
+
+            $data = Invoke-AccioTool -ToolName $ToolName -Arguments $arguments
+            Write-Json ([ordered]@{
+                action = 'call-tool'
+                tool = $ToolName
                 request = $arguments
                 data = $data
             })
