@@ -4,6 +4,11 @@
 
 本技能不会绕过登录或认证。请仅用于你有权访问的 Accio 与 Alibaba.com 账号。
 
+## 📣 QQ 交流群
+
+> [!IMPORTANT]
+> **交流群号：`1094787834`**
+
 ## 功能
 
 - 查询店铺经营汇总：`data_advisor_shop_summary`
