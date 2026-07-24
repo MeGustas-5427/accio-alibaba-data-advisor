@@ -12,6 +12,7 @@
 ## 功能
 
 - 缓存完整 `tools/list` 工具元数据
+- 导出可提交的公开工具目录快照
 - 按名称或用途说明检索工具
 - 调用缓存目录中的用户指定工具
 - 查询店铺经营汇总：`data_advisor_shop_summary`
@@ -46,15 +47,15 @@ Codex 会从 `SKILL.md` 读取技能说明。
 & ".\scripts\accio_data_advisor.ps1" -Action update-token
 ```
 
-3. 刷新完整工具目录并验证本地状态：
+3. 验证本地状态：
 
 ```powershell
-& ".\scripts\accio_data_advisor.ps1" -Action refresh-tools
 & ".\scripts\accio_data_advisor.ps1" -Action self-test
 ```
 
 Token 保存在 `state/credentials.dpapi`，使用 Windows CurrentUser DPAPI 加密，只能由同一台电脑上的同一 Windows 用户解密。
-完整工具目录保存在 `state/tools_catalog.json`；`list-tools` 和 `self-test` 默认只读该缓存，不重复请求远程 `tools/list`。
+最新工具目录保存在 `state/tools_catalog.json`；`update-token` 会同步刷新它，`list-tools` 和 `self-test` 默认只读该缓存，不重复请求远程 `tools/list`。
+可提交的公开快照保存在 `references/tools_catalog.snapshot.json`，保留工具说明和参数结构，不包含运行凭据。
 
 ## 使用
 
@@ -76,6 +77,12 @@ Token 保存在 `state/credentials.dpapi`，使用 Windows CurrentUser DPAPI 加
 
 ```powershell
 & ".\scripts\accio_data_advisor.ps1" -Action refresh-tools
+```
+
+导出可提交的公开快照：
+
+```powershell
+& ".\scripts\accio_data_advisor.ps1" -Action export-tools
 ```
 
 按名称或用途说明检索缓存：
@@ -122,6 +129,7 @@ Token 保存在 `state/credentials.dpapi`，使用 Windows CurrentUser DPAPI 加
 - `state/` 已由 `.gitignore` 忽略，禁止强制加入 Git。
 - 不要打印、提交或上传 Token、Refresh Token、Cookie、Authorization 或 Accio 凭据文件。
 - 不要把 `state/` 放进 `.skill` 包或其他交付物。
+- `references/tools_catalog.snapshot.json` 是经过安全处理的目录元数据，可以提交。
 - 通用工具调用前先查看缓存中的说明和输入结构；涉及写入、发送、删除或权限变更时先确认。
 - 凭据过期后，重新打开并登录 Accio，再运行 `update-token`。
 - 任一认证、工具目录或响应校验失败时，脚本会停止，不会把失败当作空数据。
@@ -133,8 +141,11 @@ Token 保存在 `state/credentials.dpapi`，使用 Windows CurrentUser DPAPI 加
 ├── .gitignore
 ├── README.md
 ├── SKILL.md
+├── references/
+│   └── tools_catalog.snapshot.json
 ├── scripts/
 │   └── accio_data_advisor.ps1
 └── state/                    # 本地生成并被 Git 忽略
-    └── credentials.dpapi
+    ├── credentials.dpapi
+    └── tools_catalog.json
 ```

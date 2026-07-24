@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('status', 'update-token', 'self-test', 'refresh-tools', 'list-tools', 'shop-summary', 'visitor-detail', 'call-tool')]
+    [ValidateSet('status', 'update-token', 'self-test', 'refresh-tools', 'export-tools', 'list-tools', 'shop-summary', 'visitor-detail', 'call-tool')]
     [string]$Action,
 
     [string]$StartDate,
@@ -33,6 +33,7 @@ $SkillDir = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $SkillDir 'state'
 $CredentialFile = Join-Path $StateDir 'credentials.dpapi'
 $ToolCatalogFile = Join-Path $StateDir 'tools_catalog.json'
+$PublicToolCatalogFile = Join-Path $SkillDir 'references\tools_catalog.snapshot.json'
 $RemoteUrl = 'https://phoenix-gw.alibaba.com/api/mcp/proxy'
 $EntropyText = 'accio-alibaba-data-advisor:v1'
 
@@ -87,6 +88,98 @@ function Write-Json {
     param([Parameter(Mandatory = $true)]$Value)
     $safe = ConvertTo-SafeValue $Value
     $safe | ConvertTo-Json -Depth 100
+}
+
+function Redact-CatalogText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return $null }
+    $safe = $Text
+    $safe = $safe -replace '(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}', '$1[REDACTED]'
+    $safe = $safe -replace '\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b', '[REDACTED]'
+    $safe = $safe -replace '(?i)((?:access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|credential|connectId|sessionKey)\s*[:=]\s*["'']?)[A-Za-z0-9._~+/=-]{16,}', '$1[REDACTED]'
+    return $safe
+}
+
+function ConvertTo-SafeCatalogValue {
+    param(
+        [AllowNull()]$Value,
+        [switch]$PropertyMap,
+        [switch]$SensitiveSchemaDefinition
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return (Redact-CatalogText $Value) }
+    if ($Value -is [ValueType] -or $Value -is [DateTime] -or $Value -is [DateTimeOffset]) { return $Value }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
+        $items = foreach ($item in $Value) {
+            ConvertTo-SafeCatalogValue $item -SensitiveSchemaDefinition:$SensitiveSchemaDefinition
+        }
+        return ,@($items)
+    }
+
+    $isDictionary = $Value -is [System.Collections.IDictionary]
+    $properties = @(if ($isDictionary) {
+        $Value.Keys | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_; Value = $Value[$_] }
+        }
+    }
+    else {
+        $Value.PSObject.Properties | Where-Object { $_.MemberType -in @('NoteProperty', 'Property') }
+    })
+    if ($properties.Count -eq 0) { return $Value }
+
+    $copy = [ordered]@{}
+    foreach ($property in $properties) {
+        $name = [string]$property.Name
+        $child = $property.Value
+        if ($PropertyMap) {
+            $copy[$name] = ConvertTo-SafeCatalogValue $child -SensitiveSchemaDefinition:(Test-SensitiveKey $name)
+        }
+        elseif ($SensitiveSchemaDefinition -and $name -in @('default', 'example', 'examples', 'const', 'enum')) {
+            $copy[$name] = '[REDACTED]'
+        }
+        elseif (Test-SensitiveKey $name) {
+            $copy[$name] = '[REDACTED]'
+        }
+        else {
+            $copy[$name] = ConvertTo-SafeCatalogValue `
+                $child `
+                -PropertyMap:($name -ceq 'properties') `
+                -SensitiveSchemaDefinition:$SensitiveSchemaDefinition
+        }
+    }
+    return [pscustomobject]$copy
+}
+
+function ConvertTo-IsoUtcString {
+    param([Parameter(Mandatory = $true)]$Value)
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime.ToString('o') }
+    if ($Value -is [DateTime]) { return $Value.ToUniversalTime().ToString('o') }
+    $parsed = [DateTimeOffset]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    )
+    return $parsed.UtcDateTime.ToString('o')
+}
+
+function Write-JsonFileAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Value
+    )
+    $directory = Split-Path -Parent $Path
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $temporary = Join-Path $directory ('.' + [IO.Path]::GetFileName($Path) + '-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $json = $Value | ConvertTo-Json -Depth 100
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temporary, $Path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
 }
 
 function Get-Entropy {
@@ -315,23 +408,14 @@ function Save-ToolCatalog {
     $toolArray = @($Tools)
     if ($toolArray.Count -eq 0) { throw 'Cannot cache an empty tool catalog.' }
 
-    [IO.Directory]::CreateDirectory($StateDir) | Out-Null
     $payload = [ordered]@{
         schemaVersion = 1
         fetchedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
         remoteUrl = $RemoteUrl
         toolCount = $toolArray.Count
-        tools = @($toolArray | ForEach-Object { ConvertTo-SafeValue $_ })
+        tools = @($toolArray | ForEach-Object { ConvertTo-SafeCatalogValue $_ })
     }
-    $temporary = Join-Path $StateDir ('.tools-catalog-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-    try {
-        $json = $payload | ConvertTo-Json -Depth 100
-        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($temporary, $ToolCatalogFile, $true)
-    }
-    finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
+    Write-JsonFileAtomically -Path $ToolCatalogFile -Value $payload
     return [pscustomobject]$payload
 }
 
@@ -341,6 +425,12 @@ function Read-ToolCatalog {
     }
 
     $catalog = Get-Content -Raw -LiteralPath $ToolCatalogFile -Encoding UTF8 | ConvertFrom-Json -Depth 100
+    if ($null -eq $catalog.PSObject.Properties['schemaVersion'] -or [int]$catalog.schemaVersion -ne 1) {
+        throw 'Tool catalog cache has an unsupported schema version.'
+    }
+    if ($null -eq $catalog.PSObject.Properties['fetchedAtUtc']) {
+        throw 'Tool catalog cache has no fetchedAtUtc value.'
+    }
     if ($null -eq $catalog.PSObject.Properties['tools']) { throw 'Tool catalog cache has no tools array.' }
     $tools = @($catalog.tools)
     if ($tools.Count -eq 0) { throw 'Tool catalog cache is empty.' }
@@ -350,7 +440,21 @@ function Read-ToolCatalog {
     ) {
         throw 'Tool catalog cache count does not match its tools array.'
     }
+    $catalog.fetchedAtUtc = ConvertTo-IsoUtcString $catalog.fetchedAtUtc
     return $catalog
+}
+
+function Save-PublicToolCatalog {
+    $catalog = Read-ToolCatalog
+    $payload = [ordered]@{
+        schemaVersion = [int]$catalog.schemaVersion
+        fetchedAtUtc = [string]$catalog.fetchedAtUtc
+        remoteUrl = [string]$catalog.remoteUrl
+        toolCount = [int]$catalog.toolCount
+        tools = @($catalog.tools)
+    }
+    Write-JsonFileAtomically -Path $PublicToolCatalogFile -Value $payload
+    return [pscustomobject]$payload
 }
 
 function Assert-ToolCached {
@@ -358,8 +462,14 @@ function Assert-ToolCached {
     if ([string]::IsNullOrWhiteSpace($Name)) { throw 'ToolName is required.' }
 
     $catalog = Read-ToolCatalog
-    $matches = @($catalog.tools | Where-Object { [string]$_.name -eq $Name })
-    if ($matches.Count -eq 0) { throw "Tool is not present in the cached catalog: $Name" }
+    $matches = @($catalog.tools | Where-Object { [string]$_.name -ceq $Name })
+    if ($matches.Count -eq 0) {
+        $caseInsensitive = @($catalog.tools | Where-Object { [string]$_.name -eq $Name })
+        if ($caseInsensitive.Count -eq 1) {
+            throw "Tool names are case-sensitive. Use: $([string]$caseInsensitive[0].name)"
+        }
+        throw "Tool is not present in the cached catalog: $Name"
+    }
     if ($matches.Count -gt 1) { throw "Cached catalog contains duplicate tool names: $Name" }
 }
 
@@ -500,6 +610,17 @@ try {
                 toolCatalogFile = $ToolCatalogFile
                 fetchedAtUtc = $catalog.fetchedAtUtc
                 count = $tools.Count
+            })
+        }
+
+        'export-tools' {
+            $catalog = Save-PublicToolCatalog
+            Write-Json ([ordered]@{
+                action = 'export-tools'
+                exported = $true
+                publicToolCatalogFile = $PublicToolCatalogFile
+                fetchedAtUtc = $catalog.fetchedAtUtc
+                count = $catalog.toolCount
             })
         }
 
