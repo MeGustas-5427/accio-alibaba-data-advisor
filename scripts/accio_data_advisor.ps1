@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('status', 'update-token', 'self-test', 'refresh-tools', 'export-tools', 'list-tools', 'shop-summary', 'visitor-detail', 'call-tool')]
+    [ValidateSet('status', 'update-token', 'self-test', 'refresh-tools', 'list-tools', 'shop-summary', 'visitor-detail', 'call-tool')]
     [string]$Action,
 
     [string]$StartDate,
@@ -32,8 +32,7 @@ Add-Type -AssemblyName System.Security
 $SkillDir = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $SkillDir 'state'
 $CredentialFile = Join-Path $StateDir 'credentials.dpapi'
-$ToolCatalogFile = Join-Path $StateDir 'tools_catalog.json'
-$PublicToolCatalogFile = Join-Path $SkillDir 'references\tools_catalog.snapshot.json'
+$ToolCatalogFile = Join-Path $SkillDir 'references\tools_catalog.json'
 $RemoteUrl = 'https://phoenix-gw.alibaba.com/api/mcp/proxy'
 $EntropyText = 'accio-alibaba-data-advisor:v1'
 
@@ -444,19 +443,6 @@ function Read-ToolCatalog {
     return $catalog
 }
 
-function Save-PublicToolCatalog {
-    $catalog = Read-ToolCatalog
-    $payload = [ordered]@{
-        schemaVersion = [int]$catalog.schemaVersion
-        fetchedAtUtc = [string]$catalog.fetchedAtUtc
-        remoteUrl = [string]$catalog.remoteUrl
-        toolCount = [int]$catalog.toolCount
-        tools = @($catalog.tools)
-    }
-    Write-JsonFileAtomically -Path $PublicToolCatalogFile -Value $payload
-    return [pscustomobject]$payload
-}
-
 function Assert-ToolCached {
     param([Parameter(Mandatory = $true)][string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) { throw 'ToolName is required.' }
@@ -610,17 +596,6 @@ try {
                 toolCatalogFile = $ToolCatalogFile
                 fetchedAtUtc = $catalog.fetchedAtUtc
                 count = $tools.Count
-            })
-        }
-
-        'export-tools' {
-            $catalog = Save-PublicToolCatalog
-            Write-Json ([ordered]@{
-                action = 'export-tools'
-                exported = $true
-                publicToolCatalogFile = $PublicToolCatalogFile
-                fetchedAtUtc = $catalog.fetchedAtUtc
-                count = $catalog.toolCount
             })
         }
 
