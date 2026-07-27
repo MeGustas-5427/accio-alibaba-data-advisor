@@ -42,6 +42,14 @@ cd "$env:USERPROFILE\.codex\skills\accio-alibaba-data-advisor"
 
 仅用于你有权访问的账号。认证信息使用 Windows CurrentUser DPAPI 加密，不会提交到 Git。
 
+## License
+
+本仓库原创的 `SKILL.md`、`README.md`、`scripts/` 和 `assets/` 采用 [MIT License](LICENSE)。
+
+`references/tools_catalog.json` 由 Accio 远程服务生成，可能包含第三方工具说明和参数结构，不属于本项目的 MIT 再授权范围，适用其原始提供方的条款。
+
+本项目是非官方项目，与 Alibaba.com 或 Accio 无隶属、赞助或背书关系。相关名称和商标归各自权利人所有。
+
 ## QQ 交流群
 
 `1094787834`
